@@ -45,9 +45,22 @@ import {
 // Khóa Gemini chỉ được nhập trên thiết bị của giảng viên và lưu cục bộ trong
 // trình duyệt. Không nhúng khóa vào mã nguồn và không đưa khóa vào JSON tiến trình.
 const GEMINI_API_KEY_STORAGE = "ifa-thesis-gemini-api-key";
+const GEMINI_MODEL_SELECTION_STORAGE = "ifa-thesis-gemini-model-selection";
 const GEMINI_MODEL_PRIMARY = "gemini-3.7-flash";
-const GEMINI_MODEL_FALLBACK = "gemini-3-flash-preview";
-const APP_VERSION = "V2.8";
+const GEMINI_MODEL_FALLBACK_CHAIN = [
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-2.5-flash"
+];
+const GEMINI_MODEL_OPTIONS = [
+  { value: "auto", label: "Tự động", detail: "3.7 → 3.6 → 3.5 → 2.5 khi model quá tải" },
+  { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash", detail: "Mới nhất, chất lượng cao" },
+  { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash", detail: "Ổn định, cân bằng" },
+  { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash", detail: "Ổn định, tải nhẹ hơn" },
+  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", detail: "Tương thích rộng" }
+];
+const APP_VERSION = "V2.9";
 const PROJECT_SCHEMA_VERSION = 32;
 const GEMINI_FILE_MAX_PDF_BYTES = 50 * 1024 * 1024;
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 90000;
@@ -1145,9 +1158,17 @@ export default function App() {
   const [aiSuspectDetailProject, setAiSuspectDetailProject] = useState(null);
   const [rawAIResponseProject, setRawAIResponseProject] = useState(null);
   const [toast, setToast] = useState({ message: "", type: "success" });
+  const toastTimerRef = useRef(null);
   
   const [gradingProjectId, setGradingProjectId] = useState(null);
   const [gradingOperationByProject, setGradingOperationByProject] = useState({});
+  const [selectedGeminiModel, setSelectedGeminiModel] = useState(() => {
+    if (typeof window === 'undefined') return GEMINI_MODEL_PRIMARY;
+    try {
+      const saved = String(localStorage.getItem(GEMINI_MODEL_SELECTION_STORAGE) || GEMINI_MODEL_PRIMARY);
+      return GEMINI_MODEL_OPTIONS.some(option => option.value === saved) ? saved : GEMINI_MODEL_PRIMARY;
+    } catch (_) { return GEMINI_MODEL_PRIMARY; }
+  });
   const [activeGeminiModel, setActiveGeminiModel] = useState(GEMINI_MODEL_PRIMARY);
   const stopBatchRef = useRef(false);
   const activeRequestControllerRef = useRef(null);
@@ -1227,8 +1248,32 @@ export default function App() {
   }, [classListsByRole, lecturerRole]);
 
   const showToast = (message, type = "success") => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     setToast({ message, type });
-    setTimeout(() => setToast({ message: "", type: "success" }), 4000);
+    // Lỗi phải được giữ nguyên để giảng viên có thời gian đọc/sao chép và tự đóng.
+    if (type !== "error") {
+      toastTimerRef.current = window.setTimeout(() => {
+        setToast({ message: "", type: "success" });
+        toastTimerRef.current = null;
+      }, 4000);
+    }
+  };
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
+  const handleGeminiModelSelectionChange = (event) => {
+    const nextSelection = event.target.value;
+    if (!GEMINI_MODEL_OPTIONS.some(option => option.value === nextSelection)) return;
+    const firstModel = nextSelection === "auto" ? GEMINI_MODEL_PRIMARY : nextSelection;
+    try { localStorage.setItem(GEMINI_MODEL_SELECTION_STORAGE, nextSelection); } catch (_) {}
+    setSelectedGeminiModel(nextSelection);
+    activeGeminiModelRef.current = firstModel;
+    setActiveGeminiModel(firstModel);
+    showToast(nextSelection === "auto"
+      ? "Đã chọn tự động chuyển model khi Gemini quá tải."
+      : `Đã chọn ${GEMINI_MODEL_OPTIONS.find(option => option.value === nextSelection)?.label || nextSelection}.`);
   };
 
   const collectRawAIResponses = (project) => {
@@ -1548,7 +1593,12 @@ export default function App() {
         return await response.json();
       } catch (error) {
         if (error?.name === "AbortError") throw error;
-        const retryable = !error?.status || [408, 409, 425, 429].includes(error.status) || error.status >= 500;
+        const quotaExhausted = error?.status === 429
+          && /quota exceeded|exceeded your current quota|free_tier_requests/i.test(String(error?.message || ""));
+        const shortRateLimit = error?.status === 429
+          && !quotaExhausted
+          && (!error?.retryAfterMs || error.retryAfterMs <= 60000);
+        const retryable = !error?.status || [408, 409, 425].includes(error.status) || shortRateLimit || error.status >= 500;
         if (attempt === retries || !retryable) throw error;
         if (typeof onRetry === 'function') onRetry(attempt, retries, error);
         const waitMs = error?.retryAfterMs || Math.min(12000, backoffMs * Math.pow(2, attempt - 1));
@@ -1563,7 +1613,9 @@ export default function App() {
       throw new Error("Chưa có Gemini API key. Hãy bấm ‘Khóa Gemini’ và lưu khóa trước khi chấm.");
     }
     const preferredModel = activeGeminiModelRef.current || GEMINI_MODEL_PRIMARY;
-    const candidateModels = [...new Set([preferredModel, GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK])];
+    const candidateModels = selectedGeminiModel === "auto"
+      ? [...new Set([preferredModel, ...GEMINI_MODEL_FALLBACK_CHAIN])]
+      : [selectedGeminiModel || GEMINI_MODEL_PRIMARY];
     let lastError = null;
     for (let modelIndex = 0; modelIndex < candidateModels.length; modelIndex += 1) {
       const model = candidateModels[modelIndex];
@@ -1576,7 +1628,7 @@ export default function App() {
             body: JSON.stringify(payload),
             signal
           },
-          options.retries ?? 5,
+          selectedGeminiModel === "auto" ? Math.min(options.retries ?? 5, 3) : (options.retries ?? 5),
           options.backoffMs ?? 1200,
           options.onRetry || null
         );
@@ -1587,11 +1639,19 @@ export default function App() {
         return data;
       } catch (error) {
         lastError = error;
+        if (!error.technicalMessage) error.technicalMessage = String(error?.message || "");
+        if (error?.status === 429 && /quota exceeded|exceeded your current quota|free_tier_requests/i.test(error.technicalMessage)) {
+          error.message = `Đã hết hạn mức của model ${model}. Hệ thống đã dừng yêu cầu này; hãy chọn model khác hoặc kiểm tra gói Gemini API.`;
+        } else if (error?.status === 503) {
+          error.message = `Model ${model} đang quá tải (Gemini API 503). ${selectedGeminiModel === "auto" ? "Hệ thống sẽ thử model dự phòng nếu còn lựa chọn." : "Hãy thử lại sau hoặc chọn chế độ Tự động/model khác."}`;
+        }
         const modelUnavailable = [400, 404].includes(error?.status)
-          && /model|not found|not supported|unsupported|không.*hỗ trợ/i.test(String(error?.message || ""));
-        if (!modelUnavailable || modelIndex === candidateModels.length - 1) throw error;
+          && /model|not found|not supported|unsupported|không.*hỗ trợ/i.test(String(error?.technicalMessage || error?.message || ""));
+        const modelOverloaded = error?.status === 503;
+        const canFallback = selectedGeminiModel === "auto" && (modelUnavailable || modelOverloaded);
+        if (!canFallback || modelIndex === candidateModels.length - 1) throw error;
         if (options.projectId) {
-          recordGradingProgress(options.projectId, `Model ${model} chưa khả dụng; đang chuyển sang ${candidateModels[modelIndex + 1]}...`, `model-fallback-${modelIndex}`);
+          recordGradingProgress(options.projectId, `${modelOverloaded ? `Model ${model} đang quá tải` : `Model ${model} chưa khả dụng`}; đang chuyển sang ${candidateModels[modelIndex + 1]}...`, `model-fallback-${modelIndex}`);
         }
       }
     }
@@ -4619,6 +4679,11 @@ Trả JSON đúng schema, đủ đúng một kết quả cho mỗi projectId.` }
         if (err?.name === "AbortError") break;
         failGradingProgress(current.id, `${currentRole === 'sua_bai' ? 'AI góp ý thất bại' : 'Chấm AI thất bại'}: ${err?.message || "Lỗi không xác định"}`);
         simulateStandardGrading(current.id, err?.message || "Lỗi không xác định", err?.aiRawResponses || []);
+        if (err?.status === 429) {
+          stopBatchRef.current = true;
+          setErrorMsg(err?.message || "Đã hết hạn mức Gemini API. Hãy chọn model khác trước khi tiếp tục.");
+          showToast(err?.message || "Đã hết hạn mức Gemini API. Hàng đợi chấm đã dừng.", "error");
+        }
       }
       activeRequestControllerRef.current = null;
       setGradingProjectId(null);
@@ -4740,6 +4805,8 @@ Trả JSON đúng schema, đủ đúng một kết quả cho mỗi projectId.` }
       if (err?.name !== "AbortError") {
         failGradingProgress(targetId, `${targetRole === 'sua_bai' ? 'AI góp ý thất bại' : 'Chấm AI thất bại'}: ${err?.message || "Lỗi không xác định"}`);
         simulateStandardGrading(targetId, err?.message || "Lỗi không xác định", err?.aiRawResponses || []);
+        setErrorMsg(err?.message || "AI chấm lỗi. Vui lòng kiểm tra model và hạn mức API.");
+        showToast(err?.message || "AI chấm lỗi. Vui lòng kiểm tra model và hạn mức API.", "error");
       }
     } finally {
       activeRequestControllerRef.current = null;
@@ -6018,7 +6085,8 @@ ${text.substring(0, 45000)}`;
     setIsTestingApiKey(true);
     setApiKeyStatus('Đang kiểm tra khóa với Gemini...');
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_PRIMARY}`, {
+      const modelToTest = selectedGeminiModel === "auto" ? GEMINI_MODEL_PRIMARY : selectedGeminiModel;
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelToTest}`, {
         method: 'GET',
         headers: { 'x-goog-api-key': candidateKey }
       });
@@ -6030,9 +6098,9 @@ ${text.substring(0, 45000)}`;
       }
       localStorage.setItem(GEMINI_API_KEY_STORAGE, candidateKey);
       setApiKey(candidateKey);
-      activeGeminiModelRef.current = GEMINI_MODEL_PRIMARY;
-      setActiveGeminiModel(GEMINI_MODEL_PRIMARY);
-      setApiKeyStatus('Khóa hợp lệ và đã được lưu riêng trên trình duyệt này.');
+      activeGeminiModelRef.current = modelToTest;
+      setActiveGeminiModel(modelToTest);
+      setApiKeyStatus(`Khóa hợp lệ với ${modelToTest} và đã được lưu riêng trên trình duyệt này.`);
       showToast('Đã kết nối Gemini API thành công.', 'success');
       window.setTimeout(() => setShowApiKeyModal(false), 500);
     } catch (error) {
@@ -6055,10 +6123,14 @@ ${text.substring(0, 45000)}`;
     <div className={`min-h-screen transition-colors duration-300 font-sans flex flex-col antialiased relative ${theme === 'dark' ? 'bg-slate-900 text-slate-100' : 'bg-slate-50 text-slate-800'}`}>
       {/* Toast Notification Container: GREEN for all, RED only for Error */}
       {toast.message && (
-        <div className="fixed top-24 left-1/2 transform -translate-x-1/2 z-[10000] animate-fade-in">
-          <div className={`flex items-center gap-2 px-5 py-3 rounded-2xl shadow-2xl border text-xs font-bold font-mono tracking-wide ${toast.type === "error" ? "bg-rose-950/90 text-rose-400 border-rose-500/30" : "bg-emerald-950/90 text-emerald-400 border-emerald-500/30"}`}>
-            {toast.type === "error" ? <AlertTriangle className="w-4 h-4" /> : <CheckCircle className="w-4 h-4" />}
-            <span>{toast.message}</span>
+        <div className="fixed top-24 left-1/2 transform -translate-x-1/2 z-[10000] w-[min(94vw,900px)] animate-fade-in">
+          <div className={`flex items-start gap-3 px-5 py-3 rounded-2xl shadow-2xl border text-xs font-bold font-mono tracking-wide ${toast.type === "error" ? "bg-rose-950/95 text-rose-300 border-rose-500/40" : "bg-emerald-950/95 text-emerald-300 border-emerald-500/40"}`}>
+            {toast.type === "error" ? <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" /> : <CheckCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />}
+            <span className="flex-1 min-w-0 max-h-32 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed">{toast.message}</span>
+            {toast.type === "error" && (
+              <button type="button" onClick={() => navigator.clipboard?.writeText(String(toast.message || ""))} className="p-1.5 rounded-lg hover:bg-white/10 flex-shrink-0" title="Sao chép lỗi" aria-label="Sao chép lỗi"><Copy className="w-4 h-4" /></button>
+            )}
+            <button type="button" onClick={() => setToast({ message: "", type: "success" })} className="p-1.5 rounded-lg hover:bg-white/10 flex-shrink-0" title="Đóng thông báo" aria-label="Đóng thông báo"><X className="w-4 h-4" /></button>
           </div>
         </div>
       )}
@@ -6076,6 +6148,10 @@ ${text.substring(0, 45000)}`;
             <div className="p-5 flex flex-col gap-3">
               <label className="text-[10px] font-bold uppercase text-slate-500">Gemini API key</label>
               <input type="password" autoComplete="off" value={apiKeyDraft} onChange={event => { setApiKeyDraft(event.target.value); setApiKeyStatus(''); }} onKeyDown={event => { if (event.key === 'Enter') handleTestAndSaveApiKey(); }} className={`w-full rounded-xl border px-4 py-3 font-mono text-xs outline-none focus:border-indigo-500 ${theme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`} placeholder="Dán khóa Gemini tại đây..." />
+              <label className="text-[10px] font-bold uppercase text-slate-500 mt-1">Mô hình dùng để chấm</label>
+              <select value={selectedGeminiModel} onChange={handleGeminiModelSelectionChange} disabled={isTestingApiKey} className={`w-full rounded-xl border px-4 py-3 text-xs font-bold outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-50 ${theme === 'dark' ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`}>
+                {GEMINI_MODEL_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label} — {option.detail}</option>)}
+              </select>
               {apiKeyStatus && <p className={`text-[10px] leading-relaxed ${/hợp lệ|thành công|đã được lưu/i.test(apiKeyStatus) ? 'text-emerald-500' : 'text-amber-500'}`}>{apiKeyStatus}</p>}
               <p className="text-[9px] text-slate-500">Không gửi khóa qua ChatGPT, email hoặc lưu trong file mã nguồn. Có thể tạo khóa tại Google AI Studio và xóa khỏi trình duyệt bất cứ lúc nào.</p>
             </div>
@@ -6101,7 +6177,22 @@ ${text.substring(0, 45000)}`;
             <p className={`text-xs font-medium font-mono ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>{lecturerRole === 'sua_bai' ? "Hệ thống AI góp ý hoàn thiện thuyết minh ĐATN/ĐATH" : "Hệ thống AI Thẩm định & Chấm điểm ĐATN/ĐATH"}</p>
           </div>
         </div>
-        <button type="button" onClick={() => { setApiKeyDraft(apiKey); setApiKeyStatus(''); setShowApiKeyModal(true); }} className={`border px-3 py-2 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all ${apiKey ? 'bg-emerald-600/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-600/25' : 'bg-amber-600/15 border-amber-500/50 text-amber-400 animate-pulse'}`} title="Cấu hình Gemini API key trên thiết bị này"><KeyRound className="w-4 h-4" />{apiKey ? 'Gemini đã kết nối' : 'Nhập khóa Gemini'}</button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <label className={`border rounded-xl px-3 py-2 flex items-center gap-2 ${theme === 'dark' ? 'bg-slate-900/80 border-slate-700 text-slate-300' : 'bg-white border-slate-300 text-slate-700'}`} title={GEMINI_MODEL_OPTIONS.find(option => option.value === selectedGeminiModel)?.detail || "Chọn model Gemini khi chấm"}>
+            <Sliders className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+            <span className="text-[9px] font-black uppercase tracking-wider hidden sm:inline">Model</span>
+            <select
+              value={selectedGeminiModel}
+              onChange={handleGeminiModelSelectionChange}
+              disabled={loading || batchLoading || isCalibratingScores || Boolean(gradingProjectId)}
+              className={`bg-transparent text-xs font-black outline-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 ${theme === 'dark' ? 'text-slate-100' : 'text-slate-900'}`}
+              aria-label="Chọn mô hình Gemini"
+            >
+              {GEMINI_MODEL_OPTIONS.map(option => <option key={option.value} value={option.value} className="bg-slate-950 text-slate-100">{option.label}</option>)}
+            </select>
+          </label>
+          <button type="button" onClick={() => { setApiKeyDraft(apiKey); setApiKeyStatus(''); setShowApiKeyModal(true); }} className={`border px-3 py-2 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all ${apiKey ? 'bg-emerald-600/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-600/25' : 'bg-amber-600/15 border-amber-500/50 text-amber-400 animate-pulse'}`} title="Cấu hình Gemini API key trên thiết bị này"><KeyRound className="w-4 h-4" />{apiKey ? 'Gemini đã kết nối' : 'Nhập khóa Gemini'}</button>
+        </div>
       </header>
 
       {/* MAIN CONTAINER */}
@@ -7647,7 +7738,7 @@ ${text.substring(0, 45000)}`;
       {/* FOOTER */}
       <footer className={`py-4 mt-auto border-t flex flex-col items-center justify-center gap-1 ${theme === 'dark' ? 'border-slate-800 text-slate-500' : 'border-slate-200 text-slate-500'}`}>
         <p className="text-xs font-semibold">Built by: <span className="font-black text-rose-500">Trần Quang Hải</span></p>
-        <p className="text-[10px] font-mono">Hệ thống Đánh giá Đồ án Tốt nghiệp · <span className="font-black text-indigo-400">Phiên bản {APP_VERSION}</span> · Model đang dùng: <span className="font-black text-emerald-400">{activeGeminiModel}</span></p>
+        <p className="text-[10px] font-mono">Hệ thống Đánh giá Đồ án Tốt nghiệp · <span className="font-black text-indigo-400">Phiên bản {APP_VERSION}</span> · Lựa chọn: <span className="font-black text-indigo-400">{GEMINI_MODEL_OPTIONS.find(option => option.value === selectedGeminiModel)?.label || selectedGeminiModel}</span> · Model thực tế: <span className="font-black text-emerald-400">{activeGeminiModel}</span></p>
       </footer>
 
       {/* HIDDEN INPUTS */}
