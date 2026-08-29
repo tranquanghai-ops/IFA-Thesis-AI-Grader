@@ -60,7 +60,7 @@ const GEMINI_MODEL_OPTIONS = [
   { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash", detail: "Ổn định, tải nhẹ hơn" },
   { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", detail: "Tương thích rộng" }
 ];
-const APP_VERSION = "V2.9";
+const APP_VERSION = "V3.0";
 const PROJECT_SCHEMA_VERSION = 32;
 const GEMINI_FILE_MAX_PDF_BYTES = 50 * 1024 * 1024;
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 90000;
@@ -1097,10 +1097,9 @@ export default function App() {
     if (typeof window === 'undefined') return '';
     try { return String(localStorage.getItem(GEMINI_API_KEY_STORAGE) || ''); } catch (_) { return ''; }
   });
-  const [showApiKeyModal, setShowApiKeyModal] = useState(() => {
-    if (typeof window === 'undefined') return false;
-    try { return !localStorage.getItem(GEMINI_API_KEY_STORAGE); } catch (_) { return true; }
-  });
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [serverGeminiAvailable, setServerGeminiAvailable] = useState(false);
+  const [serverGeminiChecked, setServerGeminiChecked] = useState(false);
   const [isTestingApiKey, setIsTestingApiKey] = useState(false);
   const [apiKeyStatus, setApiKeyStatus] = useState('');
   const [theme, setTheme] = useState(() => {
@@ -1261,6 +1260,29 @@ export default function App() {
 
   useEffect(() => () => {
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkServerGemini = async () => {
+      let available = false;
+      try {
+        const response = await fetch('/api/gemini/status', { cache: 'no-store' });
+        const status = response.ok ? await response.json() : null;
+        available = Boolean(status?.available && status?.configured);
+      } catch (_) {}
+      if (cancelled) return;
+      setServerGeminiAvailable(available);
+      setServerGeminiChecked(true);
+      if (available) {
+        setShowApiKeyModal(false);
+        setApiKeyStatus('Gemini đã được AI Studio kết nối an toàn phía máy chủ.');
+      } else if (!String(apiKey || '').trim()) {
+        setShowApiKeyModal(true);
+      }
+    };
+    checkServerGemini();
+    return () => { cancelled = true; };
   }, []);
 
   const handleGeminiModelSelectionChange = (event) => {
@@ -1607,8 +1629,16 @@ export default function App() {
     }
   };
 
+  const geminiApiUrl = path => serverGeminiAvailable
+    ? `/api/gemini/${String(path || '').replace(/^\/+/, '')}`
+    : `https://generativelanguage.googleapis.com/${String(path || '').replace(/^\/+/, '')}`;
+
+  const geminiApiHeaders = (headers = {}) => serverGeminiAvailable
+    ? headers
+    : { ...headers, 'x-goog-api-key': apiKey };
+
   const generateGeminiContent = async (payload, signal, options = {}) => {
-    if (!String(apiKey || '').trim()) {
+    if (!serverGeminiAvailable && !String(apiKey || '').trim()) {
       setShowApiKeyModal(true);
       throw new Error("Chưa có Gemini API key. Hãy bấm ‘Khóa Gemini’ và lưu khóa trước khi chấm.");
     }
@@ -1621,10 +1651,10 @@ export default function App() {
       const model = candidateModels[modelIndex];
       try {
         const data = await fetchWithRetry(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          geminiApiUrl(`v1beta/models/${model}:generateContent`),
           {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            headers: geminiApiHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(payload),
             signal
           },
@@ -2322,8 +2352,8 @@ ${project.extractedText ? `Văn bản trích xuất:\n${String(project.extracted
     if (!fileName || !String(fileName).startsWith("files/")) return null;
     try {
       const metadata = await fetchWithRetry(
-        `https://generativelanguage.googleapis.com/v1beta/${fileName}`,
-        { method: 'GET', headers: { 'x-goog-api-key': apiKey }, signal },
+        geminiApiUrl(`v1beta/${fileName}`),
+        { method: 'GET', headers: geminiApiHeaders(), signal },
         2,
         700
       );
@@ -2338,6 +2368,40 @@ ${project.extractedText ? `Văn bản trích xuất:\n${String(project.extracted
 
   const uploadGeminiStoredFile = async (project, sourceBlob, signal) => {
     const mimeType = project.mimeType || sourceBlob.type || "application/pdf";
+    if (serverGeminiAvailable) {
+      const uploadResponse = await fetch(`/api/gemini/files/upload?mimeType=${encodeURIComponent(mimeType)}&displayName=${encodeURIComponent(project.fileName || project.studentName || "IFA Thesis PDF")}`, {
+        method: 'POST',
+        headers: { 'Content-Type': mimeType },
+        body: sourceBlob,
+        signal
+      });
+      const responseText = await uploadResponse.text();
+      if (!uploadResponse.ok) {
+        let message = responseText.slice(0, 300) || uploadResponse.statusText;
+        try { message = JSON.parse(responseText)?.error?.message || message; } catch (_) {}
+        throw new Error(`Files API ${uploadResponse.status}: ${message}`);
+      }
+      let metadata = JSON.parse(responseText);
+      metadata = metadata?.file || metadata;
+      if (!metadata?.name) throw new Error("Files API không trả mã tệp.");
+      const processingStartedAt = Date.now();
+      while (metadata.state === "PROCESSING" || !metadata.state) {
+        if (Date.now() - processingStartedAt > GEMINI_FILE_PROCESSING_TIMEOUT_MS) {
+          throw new Error("Gemini xử lý PDF quá thời gian cho phép.");
+        }
+        await delayWithSignal(1500, signal);
+        metadata = await fetchWithRetry(
+          geminiApiUrl(`v1beta/${metadata.name}`),
+          { method: 'GET', headers: geminiApiHeaders(), signal },
+          3,
+          700
+        );
+      }
+      if (metadata.state !== "ACTIVE" || !metadata.uri) {
+        throw new Error(metadata?.error?.message || `Tệp Gemini ở trạng thái ${metadata.state || "không xác định"}.`);
+      }
+      return metadata;
+    }
     const startResponse = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files`, {
       method: 'POST',
       headers: {
@@ -2383,8 +2447,8 @@ ${project.extractedText ? `Văn bản trích xuất:\n${String(project.extracted
       }
       await delayWithSignal(1500, signal);
       metadata = await fetchWithRetry(
-        `https://generativelanguage.googleapis.com/v1beta/${metadata.name}`,
-        { method: 'GET', headers: { 'x-goog-api-key': apiKey }, signal },
+        geminiApiUrl(`v1beta/${metadata.name}`),
+        { method: 'GET', headers: geminiApiHeaders(), signal },
         3,
         700
       );
@@ -6135,7 +6199,7 @@ ${text.substring(0, 45000)}`;
         </div>
       )}
 
-      {showApiKeyModal && (
+      {showApiKeyModal && serverGeminiChecked && !serverGeminiAvailable && (
         <div className="fixed inset-0 z-[1000000] bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
           <div className={`w-full max-w-xl rounded-3xl border shadow-2xl overflow-hidden ${theme === 'dark' ? 'bg-slate-950 border-indigo-500/40' : 'bg-white border-indigo-200'}`}>
             <div className={`p-5 border-b flex items-start justify-between gap-4 ${theme === 'dark' ? 'border-slate-800 bg-indigo-950/25' : 'border-indigo-100 bg-indigo-50'}`}>
@@ -6191,7 +6255,11 @@ ${text.substring(0, 45000)}`;
               {GEMINI_MODEL_OPTIONS.map(option => <option key={option.value} value={option.value} className="bg-slate-950 text-slate-100">{option.label}</option>)}
             </select>
           </label>
-          <button type="button" onClick={() => { setApiKeyDraft(apiKey); setApiKeyStatus(''); setShowApiKeyModal(true); }} className={`border px-3 py-2 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all ${apiKey ? 'bg-emerald-600/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-600/25' : 'bg-amber-600/15 border-amber-500/50 text-amber-400 animate-pulse'}`} title="Cấu hình Gemini API key trên thiết bị này"><KeyRound className="w-4 h-4" />{apiKey ? 'Gemini đã kết nối' : 'Nhập khóa Gemini'}</button>
+          {serverGeminiAvailable ? (
+            <div className="border px-3 py-2 rounded-xl text-xs font-black flex items-center gap-2 bg-emerald-600/15 border-emerald-500/40 text-emerald-400" title="Khóa Gemini được AI Studio giữ an toàn phía máy chủ"><KeyRound className="w-4 h-4" />Gemini AI Studio</div>
+          ) : (
+            <button type="button" onClick={() => { setApiKeyDraft(apiKey); setApiKeyStatus(''); setShowApiKeyModal(true); }} className={`border px-3 py-2 rounded-xl text-xs font-black flex items-center gap-2 cursor-pointer transition-all ${apiKey ? 'bg-emerald-600/15 border-emerald-500/40 text-emerald-400 hover:bg-emerald-600/25' : 'bg-amber-600/15 border-amber-500/50 text-amber-400 animate-pulse'}`} title="Cấu hình Gemini API key trên thiết bị này"><KeyRound className="w-4 h-4" />{apiKey ? 'Gemini đã kết nối' : 'Nhập khóa Gemini'}</button>
+          )}
         </div>
       </header>
 
