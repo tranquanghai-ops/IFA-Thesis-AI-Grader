@@ -51,17 +51,19 @@ const GEMINI_MODEL_FALLBACK_CHAIN = [
   "gemini-3.7-flash",
   "gemini-3.6-flash",
   "gemini-3.5-flash",
+  "gemini-3-flash-preview",
   "gemini-2.5-flash"
 ];
 const GEMINI_MODEL_OPTIONS = [
-  { value: "auto", label: "Tự động", detail: "3.7 → 3.6 → 3.5 → 2.5 khi model quá tải" },
+  { value: "auto", label: "Tự động", detail: "3.7 → 3.6 → 3.5 → Flash Preview → 2.5 khi model quá tải" },
   { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash", detail: "Mới nhất, chất lượng cao" },
   { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash", detail: "Ổn định, cân bằng" },
   { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash", detail: "Ổn định, tải nhẹ hơn" },
+  { value: "gemini-3-flash-preview", label: "Gemini 3 Flash Preview", detail: "Nhanh, phù hợp tác vụ đơn giản và tiết kiệm hạn mức" },
   { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", detail: "Tương thích rộng" }
 ];
-const APP_VERSION = "V3.1";
-const PROJECT_SCHEMA_VERSION = 33;
+const APP_VERSION = "V3.2";
+const PROJECT_SCHEMA_VERSION = 34;
 const GEMINI_FILE_MAX_PDF_BYTES = 50 * 1024 * 1024;
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 90000;
 const PDF_CHUNK_SIZE = 125;
