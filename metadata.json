@@ -1,0 +1,6 @@
+{
+  "name": "IFA Thesis AI Grader",
+  "description": "Hỗ trợ giảng viên đánh giá thuyết minh đồ án tốt nghiệp",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
